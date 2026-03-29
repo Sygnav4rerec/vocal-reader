@@ -11,9 +11,15 @@ export default function VocalReader() {
   const [cameraError, setCameraError] = useState('');
   const [isFinished, setIsFinished] = useState(false);
   const [translateY, setTranslateY] = useState(0);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
+
   const rafRef = useRef<number | null>(null);
   const lastTimeRef = useRef<number | null>(null);
   const isPlayingRef = useRef(false);
@@ -41,7 +47,6 @@ export default function VocalReader() {
     setTranslateY(0);
   }, [text, chunks.length, wordCount]);
 
-  // Speed computed fresh every frame — reads wpmRef so slider changes take effect immediately
   const getSpeed = () => {
     if (wordCountRef.current === 0 || totalScrollRef.current === 0) return 0;
     const totalMs = (wordCountRef.current / wpmRef.current) * 60000 * 1.3;
@@ -81,18 +86,22 @@ export default function VocalReader() {
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [isPlaying, tick]);
 
+  // Camera
   const startCamera = useCallback(async () => {
     try {
       setCameraError('');
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1080 } },
-        audio: false,
+        audio: true,
       });
       streamRef.current = stream;
-      if (videoRef.current) { videoRef.current.srcObject = stream; videoRef.current.play(); }
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play();
+      }
       setCameraEnabled(true);
     } catch {
-      setCameraError('Camera access denied or unavailable.');
+      setCameraError('Camera or microphone access denied.');
       setCameraEnabled(false);
     }
   }, []);
@@ -105,6 +114,96 @@ export default function VocalReader() {
   }, []);
 
   useEffect(() => () => stopCamera(), [stopCamera]);
+
+  // Pick the best supported mimeType for this browser
+  const getSupportedMimeType = () => {
+    const types = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+      'video/mp4',
+    ];
+    return types.find(t => MediaRecorder.isTypeSupported(t)) || '';
+  };
+
+  // Recording
+  const startRecording = useCallback(() => {
+    if (!streamRef.current) return;
+
+    recordedChunksRef.current = [];
+    const mimeType = getSupportedMimeType();
+
+    let mediaRecorder: MediaRecorder;
+    try {
+      mediaRecorder = new MediaRecorder(streamRef.current, mimeType ? { mimeType } : {});
+    } catch {
+      setCameraError('Recording not supported in this browser.');
+      return;
+    }
+
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        recordedChunksRef.current.push(event.data);
+      }
+    };
+
+    mediaRecorder.onstop = () => {
+      const chunks = recordedChunksRef.current;
+      if (chunks.length === 0) {
+        setCameraError('No recording data captured.');
+        setIsRecording(false);
+        setRecordingTime(0);
+        return;
+      }
+
+      const blob = new Blob(chunks, { type: mimeType || 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      // Use .webm extension — browser-native, compatible with most editors
+      const filename = `rehearsal-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.webm`;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+
+      setIsRecording(false);
+      setRecordingTime(0);
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+    };
+
+    mediaRecorderRef.current = mediaRecorder;
+
+    // start(1000) = emit ondataavailable every 1 second while recording
+    // This is the key fix — without a timeslice, data only arrives on stop
+    // which means the blob is empty if stop() is called before first chunk
+    mediaRecorder.start(1000);
+    setIsRecording(true);
+    setRecordingTime(0);
+
+    recordingTimerRef.current = setInterval(() => {
+      setRecordingTime(t => t + 1);
+    }, 1000);
+  }, []);
+
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  }, []);
+
+  const toggleRecording = useCallback(() => {
+    if (isRecording) stopRecording();
+    else startRecording();
+  }, [isRecording, startRecording, stopRecording]);
 
   const togglePlay = useCallback(() => {
     if (chunks.length === 0) return;
@@ -119,20 +218,30 @@ export default function VocalReader() {
     setTranslateY(0);
     setIsPlaying(false);
     setIsFinished(false);
-  }, []);
+    if (isRecording) stopRecording();
+  }, [isRecording, stopRecording]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
-      if (e.key === 'Escape') setIsPlaying(false);
+      if (e.key === 'Escape') {
+        setIsPlaying(false);
+        if (isRecording) stopRecording();
+      }
+      if (e.key.toLowerCase() === 'r' && cameraEnabled) toggleRecording();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlay]);
+  }, [togglePlay, toggleRecording, cameraEnabled, isRecording, stopRecording]);
+
+  const formatTime = (seconds: number) => {
+    const min = Math.floor(seconds / 60);
+    const sec = seconds % 60;
+    return `${min}:${sec.toString().padStart(2, '0')}`;
+  };
 
   return (
     <div className="min-h-screen bg-zinc-950 text-white flex flex-col overflow-hidden">
-
       <header className="border-b border-zinc-800 px-6 py-4 flex-shrink-0 z-50 relative bg-zinc-950">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -144,6 +253,7 @@ export default function VocalReader() {
               {isSidebarOpen ? 'Hide Input' : 'Show Input'}
             </button>
           </div>
+
           <div className="flex items-center gap-3">
             <button
               onClick={() => cameraEnabled ? stopCamera() : startCamera()}
@@ -155,13 +265,26 @@ export default function VocalReader() {
             >
               📷 {cameraEnabled ? 'Camera On' : 'Use Camera'}
             </button>
+
+            {cameraEnabled && (
+              <button
+                onClick={toggleRecording}
+                className={`flex items-center gap-2 text-sm px-4 py-2 rounded-xl border transition-all font-semibold ${
+                  isRecording
+                    ? 'bg-red-500 border-red-500 text-white animate-pulse'
+                    : 'border-red-500/50 text-red-400 hover:bg-red-500/10 hover:border-red-500'
+                }`}
+              >
+                {isRecording ? `⏹ Stop • ${formatTime(recordingTime)}` : '⏺ Record Rehearsal'}
+              </button>
+            )}
+
             {cameraError && <span className="text-red-400 text-xs">{cameraError}</span>}
           </div>
         </div>
       </header>
 
       <div className="flex flex-1 overflow-hidden max-w-7xl mx-auto w-full">
-
         {isSidebarOpen && (
           <div className="w-96 border-r border-zinc-800 p-6 flex-shrink-0 flex flex-col bg-zinc-950 z-40">
             <h2 className="text-lg font-medium mb-4">Your Script</h2>
@@ -207,24 +330,35 @@ export default function VocalReader() {
 
         {/* Teleprompter Stage */}
         <div className="flex-1 relative overflow-hidden">
-
-          <video ref={videoRef} autoPlay playsInline muted
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
             className="absolute inset-0 w-full h-full object-cover"
             style={{ display: cameraEnabled ? 'block' : 'none', transform: 'scaleX(-1)' }}
           />
 
-          <div className="absolute inset-0 transition-all duration-500"
-            style={{ background: cameraEnabled ? 'rgba(0,0,0,0.45)' : '#09090b' }} />
+          <div
+            className="absolute inset-0 transition-all duration-500"
+            style={{ background: cameraEnabled ? 'rgba(0,0,0,0.45)' : '#09090b' }}
+          />
+
+          {/* Recording indicator on stage */}
+          {isRecording && (
+            <div className="absolute top-4 right-4 z-40 flex items-center gap-2 bg-black/60 px-3 py-1.5 rounded-full">
+              <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+              <span className="text-red-400 text-xs font-mono font-semibold">{formatTime(recordingTime)}</span>
+            </div>
+          )}
 
           {/* Fixed clipped text window */}
           <div
             className="absolute left-0 right-0 z-20"
             style={{ bottom: WINDOW_BOTTOM, height: WINDOW_HEIGHT, overflow: 'hidden' }}
           >
-            {/* Top fade */}
             <div className="absolute top-0 left-0 right-0 z-10 pointer-events-none"
               style={{ height: '40%', background: 'linear-gradient(to bottom, rgba(0,0,0,0.95) 0%, transparent 100%)' }} />
-            {/* Bottom fade */}
             <div className="absolute bottom-0 left-0 right-0 z-10 pointer-events-none"
               style={{ height: '30%', background: 'linear-gradient(to top, rgba(0,0,0,0.95) 0%, transparent 100%)' }} />
 
@@ -257,7 +391,7 @@ export default function VocalReader() {
 
           <div className="absolute z-30 text-center text-xs text-zinc-600 pointer-events-none"
             style={{ bottom: WINDOW_BOTTOM - 22, left: 0, right: 0 }}>
-            Spacebar = Play / Pause • Esc = Stop
+            Spacebar = Play / Pause • R = Record • Esc = Stop
           </div>
         </div>
       </div>
